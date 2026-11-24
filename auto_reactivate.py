@@ -15,7 +15,7 @@ TEST_WHATSAPP = os.getenv("TEST_WHATSAPP", "false").strip().lower() == "true"
 GREEN_API_URL = (os.getenv("GREEN_API_URL") or "https://api.green-api.com").strip().rstrip("/")
 GREEN_API_ID_INSTANCE = (os.getenv("GREEN_API_ID_INSTANCE") or "").strip()
 GREEN_API_TOKEN = (os.getenv("GREEN_API_TOKEN") or "").strip()
-WHATSAPP_PHONE = (os.getenv("WHATSAPP_PHONE") or "").strip()
+WHATSAPP_PHONES_RAW = (os.getenv("WHATSAPP_PHONE") or "").strip()
 
 BUTTON_TEXT_PATTERN = re.compile(
     r"press here to change to an active organization|change to an active organization",
@@ -24,7 +24,7 @@ BUTTON_TEXT_PATTERN = re.compile(
 CHECK_STATUS_PATTERN = re.compile(r"check status", re.IGNORECASE)
 INACTIVE_TEXT_PATTERN = re.compile(r"this team is currently inactive", re.IGNORECASE)
 STOP_LINE_PATTERN = re.compile(
-    r"^(active|inactive|check status|this team is|press here|change to an active)",
+    r"^(active|inactive|check status|this team is|press here|change to an active|team status|normal\b)",
     re.IGNORECASE,
 )
 
@@ -58,6 +58,16 @@ def load_urls() -> list[str]:
         line.strip()
         for line in re.split(r"[\r\n,]+", raw)
         if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def load_whatsapp_phones() -> list[str]:
+    if not WHATSAPP_PHONES_RAW:
+        return []
+    return [
+        line.strip()
+        for line in re.split(r"[\r\n,;]+", WHATSAPP_PHONES_RAW)
+        if line.strip()
     ]
 
 
@@ -117,35 +127,42 @@ def normalize_chat_id(phone: str) -> str:
 
 
 def send_whatsapp_message(message: str) -> bool:
-    if not (GREEN_API_ID_INSTANCE and GREEN_API_TOKEN and WHATSAPP_PHONE):
-        log("WhatsApp skipped: Missing GREEN-API secrets.")
+    phones = load_whatsapp_phones()
+    if not (GREEN_API_ID_INSTANCE and GREEN_API_TOKEN and phones):
+        log("WhatsApp skipped: Missing GREEN-API secrets or WHATSAPP_PHONE.")
         return False
 
     endpoint = f"{GREEN_API_URL}/waInstance{GREEN_API_ID_INSTANCE}/sendMessage/{GREEN_API_TOKEN}"
-    payload = json.dumps({
-        "chatId": normalize_chat_id(WHATSAPP_PHONE),
-        "message": message,
-    }).encode("utf-8")
+    all_ok = True
 
-    req = urllib.request.Request(
-        endpoint,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            if 200 <= resp.status < 300:
-                log("WhatsApp notification sent successfully via GREEN-API.")
-                return True
-            log(f"WhatsApp API returned HTTP {resp.status}.")
-            return False
-    except urllib.error.HTTPError as exc:
-        log(f"WhatsApp HTTP error: {exc.code} {exc.reason}")
-        return False
-    except Exception as exc:
-        log(f"WhatsApp send failed: {exc}")
-        return False
+    for idx, phone in enumerate(phones, start=1):
+        chat_id = normalize_chat_id(phone)
+        payload = json.dumps({
+            "chatId": chat_id,
+            "message": message,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            endpoint,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                if 200 <= resp.status < 300:
+                    log(f"WhatsApp notification #{idx} sent successfully via GREEN-API.")
+                else:
+                    log(f"WhatsApp recipient #{idx} returned HTTP {resp.status}.")
+                    all_ok = False
+        except urllib.error.HTTPError as exc:
+            log(f"WhatsApp recipient #{idx} HTTP error: {exc.code} {exc.reason}")
+            all_ok = False
+        except Exception as exc:
+            log(f"WhatsApp recipient #{idx} send failed: {exc}")
+            all_ok = False
+
+    return all_ok
 
 
 def check_single_url(context, idx: int, url: str) -> dict:
@@ -252,6 +269,7 @@ def main() -> int:
         )
         for idx, url in enumerate(urls, start=1):
             key = f"link_{idx}"
+            account_label = extract_email_from_url(url) or f"Account #{idx}"
             res = check_single_url(context, idx, url)
             status, team_name = res["status"], res["team_name"]
             summary_counts[status] += 1
@@ -263,8 +281,16 @@ def main() -> int:
                 old_team is not None and team_name not in ("Unknown", "Error") and old_team != team_name
             )
             if changed:
-                changes_detected.append(f"Link #{idx}: {old_team or 'Previous'} → {team_name}")
-            link_reports.append({"idx": idx, "status": status, "team_name": team_name, "changed": changed})
+                changes_detected.append(
+                    f"• *{account_label}*\n  {old_team or 'Previous'} → {team_name}"
+                )
+            link_reports.append({
+                "idx": idx,
+                "account": account_label,
+                "status": status,
+                "team_name": team_name,
+                "changed": changed,
+            })
         browser.close()
 
     state_changed = new_state != prev_state
@@ -277,16 +303,19 @@ def main() -> int:
         lines = [header, f"🕒 {now_str}", ""]
         if changes_detected:
             lines.append("*Changed:*")
-            for ch in changes_detected:
-                lines.append(f"• {ch}")
+            lines.extend(changes_detected)
             lines.append("")
-        lines.append("*Current Active Team Names:*")
+        lines.append("*Current Active Teams:*")
         for item in link_reports:
             icon = "🔄" if item["changed"] else ("✅" if item["status"] == "ACTIVE" else "⚠️")
-            lines.append(f"{icon} Link #{item['idx']}: {item['team_name']}")
+            lines.append(f"{icon} *{item['account']}*\n   ↳ {item['team_name']}")
         send_whatsapp_message("\n".join(lines))
 
-    log(f"Summary — Total: {len(urls)} | Active: {summary_counts['ACTIVE']} | Reactivated: {summary_counts['REACTIVATED']} | Errors: {summary_counts['ERROR']} | Changes: {len(changes_detected)}")
+    log(
+        f"Summary — Total: {len(urls)} | Active: {summary_counts['ACTIVE']} | "
+        f"Reactivated: {summary_counts['REACTIVATED']} | Errors: {summary_counts['ERROR']} | "
+        f"Changes: {len(changes_detected)}"
+    )
     return 1 if summary_counts["ERROR"] > 0 else 0
 
 
