@@ -165,48 +165,80 @@ def send_whatsapp_message(message: str) -> bool:
     return all_ok
 
 
-def check_single_url(context, idx: int, url: str) -> dict:
+def load_status_page(page, url: str, label: str) -> str:
+    """Open status URL, click Check Status if needed, and return page body text."""
+    try:
+        page.goto(url, wait_until="networkidle", timeout=60000)
+    except PlaywrightTimeoutError:
+        log(f"{label}: Page load timed out on networkidle; continuing...")
+        page.wait_for_load_state("domcontentloaded")
+
+    page.wait_for_timeout(3000)
+    body_text = page.inner_text("body")
+    has_status_loaded = bool(
+        re.search(r"\b(ACTIVE|INACTIVE)\b", body_text, re.IGNORECASE)
+        or BUTTON_TEXT_PATTERN.search(body_text)
+    )
+
+    if not has_status_loaded:
+        log(f"{label}: Clicking 'Check Status'...")
+        email_from_url = extract_email_from_url(url)
+        email_input = page.locator("input[type='email'], input[type='text']").first
+        if email_input.count() > 0 and email_from_url and not email_input.input_value().strip():
+            email_input.fill(email_from_url)
+        check_btn = page.locator("button, input[type='submit'], a, [role='button']").filter(
+            has_text=CHECK_STATUS_PATTERN
+        ).first
+        if check_btn.count() > 0:
+            check_btn.click()
+            try:
+                page.wait_for_load_state("networkidle", timeout=30000)
+            except PlaywrightTimeoutError:
+                pass
+            page.wait_for_timeout(3000)
+            body_text = page.inner_text("body")
+
+    return body_text
+
+
+def click_check_status_or_reload(page, url: str, label: str) -> str:
+    """Force a fresh status fetch from the server after reactivation."""
+    try:
+        page.goto(url, wait_until="networkidle", timeout=45000)
+    except PlaywrightTimeoutError:
+        pass
+    page.wait_for_timeout(2000)
+
+    check_btn = page.locator("button, input[type='submit'], a, [role='button']").filter(
+        has_text=CHECK_STATUS_PATTERN
+    ).first
+    if check_btn.count() > 0 and check_btn.is_visible():
+        check_btn.click()
+        try:
+            page.wait_for_load_state("networkidle", timeout=30000)
+        except PlaywrightTimeoutError:
+            pass
+        page.wait_for_timeout(3000)
+
+    return page.inner_text("body")
+
+
+def check_and_trigger_reactivate(context, idx: int, url: str) -> dict:
+    """Pass 1: Check status and click reactivate button if INACTIVE."""
     label = f"Link #{idx} ({mask_url(url)})"
     log(f"--- Checking {label} ---")
     page = context.new_page()
     page.on("dialog", lambda dialog: (log(f"{label}: Dialog accepted"), dialog.accept()))
 
     try:
-        try:
-            page.goto(url, wait_until="networkidle", timeout=60000)
-        except PlaywrightTimeoutError:
-            log(f"{label}: Page load timed out on networkidle; continuing...")
-            page.wait_for_load_state("domcontentloaded")
-
-        page.wait_for_timeout(3000)
-        body_text = page.inner_text("body")
-        has_status_loaded = bool(
-            re.search(r"\b(ACTIVE|INACTIVE)\b", body_text, re.IGNORECASE)
-            or BUTTON_TEXT_PATTERN.search(body_text)
-        )
-
-        if not has_status_loaded:
-            log(f"{label}: Clicking 'Check Status'...")
-            email_from_url = extract_email_from_url(url)
-            email_input = page.locator("input[type='email'], input[type='text']").first
-            if email_input.count() > 0 and email_from_url and not email_input.input_value().strip():
-                email_input.fill(email_from_url)
-            check_btn = page.locator("button, input[type='submit'], a, [role='button']").filter(
-                has_text=CHECK_STATUS_PATTERN
-            ).first
-            if check_btn.count() > 0:
-                check_btn.click()
-                try:
-                    page.wait_for_load_state("networkidle", timeout=30000)
-                except PlaywrightTimeoutError:
-                    pass
-                page.wait_for_timeout(3000)
+        body_text = load_status_page(page, url, label)
+        team_before = extract_team_name_from_text(body_text)
 
         reactivate_buttons = page.locator("button, a, [role='button']").filter(has_text=BUTTON_TEXT_PATTERN)
         btn_count = reactivate_buttons.count()
 
         if btn_count > 0:
-            log(f"{label}: Found {btn_count} INACTIVE team(s). Reactivating...")
+            log(f"{label}: Found {btn_count} INACTIVE team(s) ({team_before}). Clicking reactivate...")
             for b_idx in range(btn_count):
                 btn = reactivate_buttons.nth(b_idx)
                 if btn.is_visible():
@@ -216,34 +248,57 @@ def check_single_url(context, idx: int, url: str) -> dict:
                         page.wait_for_load_state("networkidle", timeout=30000)
                     except PlaywrightTimeoutError:
                         pass
-                    page.wait_for_timeout(4000)
+                    page.wait_for_timeout(3000)
 
-            try:
-                page.reload(wait_until="networkidle", timeout=45000)
-            except PlaywrightTimeoutError:
-                pass
-            page.wait_for_timeout(3000)
+            return {
+                "status": "REACTIVATED",
+                "team_name": team_before,
+                "team_before": team_before,
+                "needs_refresh": True,
+            }
 
-            updated_body = page.inner_text("body")
-            team_name = extract_team_name_from_text(updated_body)
-            remaining = page.locator("button, a, [role='button']").filter(has_text=BUTTON_TEXT_PATTERN).count()
-            if remaining == 0:
-                log(f"{label}: SUCCESS — Reactivated! New Team: {team_name}")
-                return {"status": "REACTIVATED", "team_name": team_name}
-            log(f"{label}: WARNING — {remaining} reactivate button(s) still visible.")
-            return {"status": "ERROR", "team_name": team_name}
-
-        updated_body = page.inner_text("body")
-        team_name = extract_team_name_from_text(updated_body)
-        if INACTIVE_TEXT_PATTERN.search(updated_body):
+        if INACTIVE_TEXT_PATTERN.search(body_text):
             log(f"{label}: WARNING — Inactive text found, but no clickable button.")
-            return {"status": "ERROR", "team_name": team_name}
+            return {"status": "ERROR", "team_name": team_before, "team_before": team_before, "needs_refresh": False}
 
-        log(f"{label}: OK — Already ACTIVE. Team: {team_name}")
-        return {"status": "ACTIVE", "team_name": team_name}
+        log(f"{label}: OK — Already ACTIVE. Team: {team_before}")
+        return {"status": "ACTIVE", "team_name": team_before, "team_before": team_before, "needs_refresh": False}
     except Exception as exc:
         log(f"{label}: ERROR — {exc}")
-        return {"status": "ERROR", "team_name": "Error"}
+        return {"status": "ERROR", "team_name": "Error", "team_before": "", "needs_refresh": False}
+    finally:
+        page.close()
+
+
+def fetch_updated_team_name(context, idx: int, url: str, team_before: str) -> dict:
+    """Pass 2: Re-check reactivated link until the new active team name appears."""
+    label = f"Link #{idx} ({mask_url(url)})"
+    page = context.new_page()
+    try:
+        # Poll up to 3 times (15s apart) so backend finishes assigning the new team
+        latest_team = team_before
+        for attempt in range(1, 4):
+            body_text = click_check_status_or_reload(page, url, label)
+            latest_team = extract_team_name_from_text(body_text)
+            remaining = page.locator("button, a, [role='button']").filter(has_text=BUTTON_TEXT_PATTERN).count()
+
+            if remaining == 0 and latest_team not in ("Unknown", "Error") and latest_team != team_before:
+                log(f"{label}: Confirmed NEW Team on check #{attempt}: {latest_team}")
+                return {"status": "REACTIVATED", "team_name": latest_team}
+
+            if attempt < 3:
+                log(f"{label}: Check #{attempt} still shows '{latest_team}'. Waiting 15s for new team name...")
+                page.wait_for_timeout(15000)
+
+        remaining = page.locator("button, a, [role='button']").filter(has_text=BUTTON_TEXT_PATTERN).count()
+        if remaining == 0:
+            log(f"{label}: Reactivated (final team shown: {latest_team})")
+            return {"status": "REACTIVATED", "team_name": latest_team}
+        log(f"{label}: WARNING — {remaining} reactivate button(s) still visible after waiting.")
+        return {"status": "ERROR", "team_name": latest_team}
+    except Exception as exc:
+        log(f"{label}: Refresh ERROR — {exc}")
+        return {"status": "ERROR", "team_name": team_before}
     finally:
         page.close()
 
@@ -267,18 +322,42 @@ def main() -> int:
             viewport={"width": 1280, "height": 900},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         )
+
+        # Pass 1: Check all links and click reactivate on any inactive ones
+        pass1_results = []
+        any_reactivated = False
         for idx, url in enumerate(urls, start=1):
+            res = check_and_trigger_reactivate(context, idx, url)
+            if res["needs_refresh"]:
+                any_reactivated = True
+            pass1_results.append((idx, url, res))
+
+        # Pass 2: If any link was reactivated, wait 25s once for backend sync, then fetch fresh new team names
+        if any_reactivated:
+            log("Waiting 25 seconds for server to finish assigning new active team name(s)...")
+            wait_page = context.new_page()
+            wait_page.wait_for_timeout(25000)
+            wait_page.close()
+
+        for idx, url, res in pass1_results:
             key = f"link_{idx}"
             account_label = extract_email_from_url(url) or f"Account #{idx}"
-            res = check_single_url(context, idx, url)
-            status, team_name = res["status"], res["team_name"]
+
+            if res["needs_refresh"]:
+                refreshed = fetch_updated_team_name(context, idx, url, res["team_before"])
+                status, team_name = refreshed["status"], refreshed["team_name"]
+            else:
+                status, team_name = res["status"], res["team_name"]
+
             summary_counts[status] += 1
-            old_team = prev_state.get(key)
+            old_team = prev_state.get(key) or res["team_before"]
             if team_name not in ("Unknown", "Error"):
                 new_state[key] = team_name
 
             changed = status == "REACTIVATED" or (
-                old_team is not None and team_name not in ("Unknown", "Error") and old_team != team_name
+                prev_state.get(key) is not None
+                and team_name not in ("Unknown", "Error")
+                and prev_state.get(key) != team_name
             )
             if changed:
                 changes_detected.append(
@@ -291,6 +370,7 @@ def main() -> int:
                 "team_name": team_name,
                 "changed": changed,
             })
+
         browser.close()
 
     state_changed = new_state != prev_state
