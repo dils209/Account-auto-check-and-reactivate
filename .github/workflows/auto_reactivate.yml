@@ -1,0 +1,71 @@
+name: Auto Check & Reactivate Teams (15 min)
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      send_test_whatsapp:
+        description: 'Send a test WhatsApp message with current 3 team names'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  check-and-reactivate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Cache Playwright Chromium browser
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-chromium-v1
+
+      - name: Restore previous team state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: team-state-${{ github.run_id }}
+          restore-keys: |
+            team-state-
+
+      - name: Install Playwright & Chromium
+        run: |
+          pip install -r requirements.txt
+          if [ "${{ steps.playwright-cache.outputs.cache-hit }}" != "true" ]; then
+            playwright install chromium
+          fi
+          playwright install-deps chromium
+
+      - name: Run status check, reactivate & notify on change
+        id: run-check
+        env:
+          STATUS_URLS: ${{ secrets.STATUS_URLS }}
+          GREEN_API_URL: ${{ secrets.GREEN_API_URL }}
+          GREEN_API_ID_INSTANCE: ${{ secrets.GREEN_API_ID_INSTANCE }}
+          GREEN_API_TOKEN: ${{ secrets.GREEN_API_TOKEN }}
+          WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
+          TEST_WHATSAPP: ${{ inputs.send_test_whatsapp || 'false' }}
+        run: python auto_reactivate.py
+
+      - name: Save updated team state
+        if: always() && steps.run-check.outputs.state_changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: team-state-${{ github.run_id }}
