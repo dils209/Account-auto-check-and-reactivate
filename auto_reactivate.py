@@ -23,6 +23,8 @@ BUTTON_TEXT_PATTERN = re.compile(
 )
 CHECK_STATUS_PATTERN = re.compile(r"check status", re.IGNORECASE)
 INACTIVE_TEXT_PATTERN = re.compile(r"this team is currently inactive", re.IGNORECASE)
+NORMAL_STATUS_PATTERN = re.compile(r"team status:\s*normal|\bnormal\b", re.IGNORECASE)
+AUTO_CHECK_FAILED_PATTERN = re.compile(r"automated check failed", re.IGNORECASE)
 STOP_LINE_PATTERN = re.compile(
     r"^(active|inactive|check status|this team is|press here|change to an active|team status|normal\b)",
     re.IGNORECASE,
@@ -91,6 +93,14 @@ def extract_team_name_from_text(body_text: str) -> str:
         else:
             i += 1
     return " / ".join(teams) if teams else "Unknown"
+
+
+def is_false_inactive_warning(body_text: str) -> bool:
+    """True when the site shows 'Team status: Normal' alongside 'Automated check failed'."""
+    return bool(
+        NORMAL_STATUS_PATTERN.search(body_text)
+        or AUTO_CHECK_FAILED_PATTERN.search(body_text)
+    )
 
 
 def load_state() -> dict:
@@ -176,7 +186,7 @@ def load_status_page(page, url: str, label: str) -> str:
     page.wait_for_timeout(3000)
     body_text = page.inner_text("body")
     has_status_loaded = bool(
-        re.search(r"\b(ACTIVE|INACTIVE)\b", body_text, re.IGNORECASE)
+        re.search(r"\b(ACTIVE|INACTIVE|NORMAL)\b", body_text, re.IGNORECASE)
         or BUTTON_TEXT_PATTERN.search(body_text)
     )
 
@@ -257,11 +267,11 @@ def check_and_trigger_reactivate(context, idx: int, url: str) -> dict:
                 "needs_refresh": True,
             }
 
-        if INACTIVE_TEXT_PATTERN.search(body_text):
+        if INACTIVE_TEXT_PATTERN.search(body_text) and not is_false_inactive_warning(body_text):
             log(f"{label}: WARNING — Inactive text found, but no clickable button.")
             return {"status": "ERROR", "team_name": team_before, "team_before": team_before, "needs_refresh": False}
 
-        log(f"{label}: OK — Already ACTIVE. Team: {team_before}")
+        log(f"{label}: OK — ACTIVE / NORMAL. Team: {team_before}")
         return {"status": "ACTIVE", "team_name": team_before, "team_before": team_before, "needs_refresh": False}
     except Exception as exc:
         log(f"{label}: ERROR — {exc}")
@@ -275,7 +285,6 @@ def fetch_updated_team_name(context, idx: int, url: str, team_before: str) -> di
     label = f"Link #{idx} ({mask_url(url)})"
     page = context.new_page()
     try:
-        # Poll up to 3 times (15s apart) so backend finishes assigning the new team
         latest_team = team_before
         for attempt in range(1, 4):
             body_text = click_check_status_or_reload(page, url, label)
